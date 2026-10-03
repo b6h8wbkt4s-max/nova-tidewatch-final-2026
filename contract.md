@@ -334,3 +334,25 @@ report.html 用于事后复盘和历史分析。
 | 验证恢复 | 确认三端同步更新 |
 
 证据统一放入 Evidence/D4/。
+
+## 12. 开放增强（可选）
+
+本阶段暂不做。先完成 D1–D5 与 E1–E3 共同完成线。
+后续如引入自动视觉感知、FastAPI、SQLite、PWA、云端部署等，再回到本节补充。
+
+## 13. 已知限制
+
+- flowLevel 本阶段来源为 simulated，不代表真实水流感知结果。
+- 固定规则阈值仅用于编程练习，不代表真实水文防汛标准。
+- 轻量 ML 使用有限历史数据，可能存在误报或漏报。
+- 系统当前面向本机或局域网演示，未做云端部署。
+- 感知模块若后续接入 model/template，适用范围与误报可能另行说明。
+
+## 14. 参考来源
+
+- 任务书：C02_03_TideWatch_综合作品任务书_V0.9R2.pdf
+- MQTT Broker：Mosquitto 或 EMQX
+- Python：paho-mqtt、pandas、matplotlib、scikit-learn
+- 前端：mqtt.js、Chart.js、Three.js
+- 微信小程序官方文档
+- Three.js 官方文档

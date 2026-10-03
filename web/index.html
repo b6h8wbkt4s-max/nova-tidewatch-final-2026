@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>TideWatch 监测台</title>
+<style>
+body { font-family: "Microsoft YaHei", sans-serif; margin: 40px; background: #fafafa; }
+h1 { color: #333; }
+#status { font-weight: bold; }
+.card { border: 2px solid #ccc; border-radius: 8px; padding: 16px; margin: 12px 0; background: white; }
+.card.洪水预警 { border-color: red; background: #ffecec; }
+.card.高水位警戒 { border-color: orange; background: #fff4e0; }
+.card.水质浑浊 { border-color: purple; background: #f4ecff; }
+.card.正常 { border-color: green; background: #ecfff0; }
+.card h2 { margin: 0 0 8px 0; }
+.card p { margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>TideWatch 监测台</h1>
+<p>连接状态：<span id="status">未连接</span></p>
+<div id="cards"></div>
+
+<script src="mqtt.min.js"></script>
+<script>
+const BROKER_WS = "ws://localhost:8083";
+const TOPIC = "tidewatch/+/state";
+
+const state = {};
+
+if (typeof mqtt === "undefined") {
+  const el = document.getElementById("status");
+  el.textContent = "mqtt.js 加载失败";
+  el.style.color = "red";
+  throw new Error("mqtt.js 加载失败");
+}
+
+const client = mqtt.connect(BROKER_WS);
+
+client.on("connect", () => {
+  document.getElementById("status").textContent = "已连接";
+  document.getElementById("status").style.color = "green";
+  client.subscribe(TOPIC);
+});
+
+client.on("error", (err) => {
+  document.getElementById("status").textContent = "连接失败：" + err.message;
+  document.getElementById("status").style.color = "red";
+});
+
+client.on("message", (topic, message) => {
+  let data;
+  try {
+    data = JSON.parse(message.toString());
+  } catch (e) {
+    console.error("JSON 解析失败", message.toString());
+    return;
+  }
+  if (!data.reachId) return;
+  state[data.reachId] = data;
+  render();
+});
+
+function render() {
+  const container = document.getElementById("cards");
+  container.innerHTML = "";
+  Object.values(state).forEach(d => {
+    const div = document.createElement("div");
+    div.className = "card " + d.status;
+    div.innerHTML = `
+      <h2>${d.reachId}</h2>
+      <p>水位：${d.waterLevel}</p>
+      <p>浊度：${d.turbidity}</p>
+      <p>水流等级：${d.flowLevel}</p>
+      <p>状态：<strong>${d.status}</strong></p>
+      <p>时间：${d.time}</p>
+    `;
+    container.appendChild(div);
+  });
+}
+</script>
+</body>
+</html>

@@ -103,3 +103,62 @@ flowLevel 一并写入统一 JSON 状态流，随每条 MQTT 状态消息发布�
 **订阅方式：** Web / 移动端 / 地图3D 订阅 `tidewatch/+/state`，一次订阅三个断面。
 
 **消息去重依据：** 优先使用 `message_id`；若无，则用 `reachId + time + waterLevel + turbidity + flowLevel` 的哈希。event_id 只用于标识事件，不用于消息去重。
+## 6. 事件状态机
+
+### 6.1 状态定义
+
+| 状态 | 含义 |
+|---|---|
+| OPEN | 待处理 |
+| HANDLING | 处理中 |
+| RECOVERED | 已恢复 |
+
+### 6.2 状态转移表
+
+| 当前状态 | 允许转移到 | 触发条件 | 说明 |
+|---|---|---|---|
+| （无） | OPEN | 出现新异常 | 新事件创建 |
+| OPEN | HANDLING | 用户执行干预动作 | 必须有干预动作 |
+| HANDLING | RECOVERED | 后续新数据满足恢复条件 | 必须由数据触发 |
+| HANDLING | OPEN | 数据进一步恶化/干预未生效 | 允许回退 |
+| OPEN/HANDLING | （保持） | 仅点击按钮、无新数据 | 不得改变状态 |
+
+### 6.3 非法转移（出现即算未达标）
+
+- OPEN → RECOVERED 直接跳过
+- 低置信度感知触发 HANDLING → RECOVERED
+- 迟到/重复消息把已 RECOVERED 改回 HANDLING
+
+### 6.4 恢复判定规则
+
+若事件由水位异常触发，恢复需 waterLevel < 7.0；
+若事件由水质异常触发，恢复需 turbidity < 60；
+若事件同时由水流异常触发，恢复还需 flowLevel ≤ 1。
+
+以上相关条件都满足，或经人工复核确认，才进入 RECOVERED。
+
+### 6.5 消息健壮性
+
+| 情况 | 处理方式 |
+|---|---|
+| 重复 | 用 message_id 或哈希去重，同一条只生效一次 |
+| 乱序 | 按 time 排序后再判断状态 |
+| 迟到 | 早于当前状态时间戳的消息不回滚已 RECOVERED 事件，最多作历史补充 |
+
+### 6.6 事件关联字段
+
+| 字段 | 含义 |
+|---|---|
+| event_id | 事件标识 |
+| reachId | 所属断面 |
+| start_time | 开始时间 |
+| problem | 问题/异常（水位/水质/水流） |
+| priority_reason | 为什么被优先关注 |
+| action | 用户采取的动作 |
+| verify_data | 后续验证数据 |
+| state | 当前事件状态 |
+| recover_time | 恢复时间/最终结果 |
+
+### 6.7 事件合并与升级（可选）
+
+本阶段不做；如后续实现，同一断面 24 小时内重复异常合并为同一事件并升级严重度。git

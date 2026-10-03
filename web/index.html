@@ -114,12 +114,29 @@ client.on("message", (topic, message) => {
       problem,
       priority_reason: `优先分 ${sc.total}（环境 ${sc.env} + 感知 ${sc.perc} + 持续 ${sc.persist}）` + (uniqueTop ? "，当前优先关注" : ""),
       action: null,
-      verify_data: null,
+      verify_data: [],
       state: "OPEN",
       recover_time: null,
     };
     events.push(ev);
     openEventByReach[data.reachId] = ev;
+  }
+
+  // D3-3：HANDLING 事件的恢复判定，只能由新数据触发
+  const ev = openEventByReach[data.reachId];
+  if (ev && ev.state === "HANDLING") {
+    ev.verify_data.push({
+      time: data.time,
+      waterLevel: data.waterLevel,
+      turbidity: data.turbidity,
+      flowLevel: data.flowLevel,
+      status: data.status,
+    });
+    if (checkRecovery(ev, data)) {
+      ev.state = "RECOVERED";
+      ev.recover_time = data.time;
+      delete openEventByReach[data.reachId];
+    }
   }
 
   render();
@@ -132,6 +149,14 @@ function scoreOf(reachId) {
   const streak = anomalyStreak[reachId] || 0;
   const persist = streak >= 3 ? 2 : (streak >= 1 ? 1 : 0);
   return { env, perc, persist, streak, total: env + perc + persist };
+}
+
+// contract 6.4：事件所有触发原因的条件都满足才算恢复
+function checkRecovery(ev, data) {
+  if (ev.problem.includes("水位异常") && data.waterLevel >= 7.0) return false;
+  if (ev.problem.includes("水质异常") && data.turbidity >= 60) return false;
+  if (ev.problem.includes("水流异常") && (data.flowLevel ?? 0) > 1) return false;
+  return true;
 }
 
 function render() {
@@ -185,6 +210,8 @@ function renderEvents() {
       <p>关注理由：${ev.priority_reason}</p>
       <p>开始时间：${ev.start_time}</p>
       ${ev.state === "HANDLING" ? `<p>处理中：${ev.action}</p>` : ""}
+      ${ev.state === "RECOVERED" ? `<p>已恢复：${ev.recover_time}</p>` : ""}
+      ${ev.state !== "OPEN" ? `<p>验证数据：${ev.verify_data.length} 条</p>` : ""}
     `;
     if (ev.state === "OPEN") {
       const btn = document.createElement("button");

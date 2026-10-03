@@ -254,3 +254,41 @@ ML 分：
 | 缺失 | waterLevel/turbidity 缺字段或缺值时，不得让规则算出错误状态，直接拒绝该条消息 |
 | 离群 | 明显超出量程的值（如 waterLevel 1000）应标记或拦截 |
 | 时钟 | time 缺失、格式错误或时间倒流时，拒绝该条消息或标记异常 |
+
+## 9. 数据链定义
+
+### 9.1 离线分析链
+
+断面采集/历史记录 → CSV → Python → 时空统计/趋势 → report.html
+
+| 环节 | 实现 |
+|---|---|
+| 断面采集/历史记录 | MQTT 模拟节点写入 CSV，或手动准备 |
+| CSV | data/tidewatch_history.csv |
+| Python | python/analyze.py，用 pandas 统计 |
+| 时空统计/趋势 | 按断面统计均值、最大值、异常次数；按时间画趋势图 |
+| report.html | report/report.html，由 Python 生成 |
+
+**要求：**
+- 数据来自系统真实运行或明确标注的模拟运行
+- 换一份新 CSV 后，分析结果能重新生成
+- 报告不能靠手工修改结果完成
+
+### 9.2 边缘实时链
+
+水文采集节点 → MQTT/JSON → 共享实时状态 → Web监测台 + 移动端 + 地图/3D
+
+| 环节 | 实现 |
+|---|---|
+| 水文采集节点 | mqtt/simulator.py，3 个断面定时发布 |
+| MQTT/JSON | Topic tidewatch/{reachId}/state，JSON 六字段 |
+| 共享实时状态 | Broker 上的 retained 消息或内存状态 |
+| Web 监测台 | web/index.html，订阅 tidewatch/+/state |
+| 移动端 | mobile/，订阅同一套 Topic |
+| 地图/3D | map3d/，订阅同一套 Topic |
+
+**要求：**
+- 至少 3 个断面节点
+- 三个断面数据不能串线
+- 新消息到达后，三端围绕同一条实时状态更新
+- 三者共享同一套实时数据源

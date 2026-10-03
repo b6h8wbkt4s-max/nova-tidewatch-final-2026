@@ -48,3 +48,42 @@
 | reach-a | 4.5 | 20 | 0 | 正常 |
 | reach-b | 9.0 | 20 | 2 | 洪水预警 |
 | reach-c | 4.5 | 75 | 1 | 水质浑浊 |
+## 4. flowLevel 水流等级与感知结果记录
+
+### 4.1 flowLevel 含义
+
+| flowLevel | 含义 |
+|---|---|
+| 0 | 缓流 |
+| 1 | 平稳 |
+| 2 | 湍急 |
+| 3 | 湍流 |
+
+### 4.2 感知结果记录字段
+
+| 字段 | 含义 |
+|---|---|
+| reachId | 所属断面 |
+| imageId | 关联图像标识（文件名/哈希/自编号），非图像来源可空 |
+| flowLevel | 水流等级 0-3 |
+| confidence | 自动感知置信度 0-1；simulated/rule/review 填 null |
+| source | simulated / rule / model / template / review |
+| time | 感知时间 |
+
+### 4.3 本作品采用的 flowLevel 来源
+
+- [x] simulated（模拟/回放）
+- [ ] rule（规则映射）
+- [ ] model（模型推理）
+- [ ] template（模板比对）
+- [ ] review（人工复核）
+
+**说明：** 共同完成线阶段采用 simulated，由 MQTT 模拟节点显式指定 flowLevel，便于先跑通环境事件—多端同步主链。开放增强阶段可另行接入 model/template 自动感知。
+
+**置信度阈值：** 不适用（simulated 不伪造模型置信度）
+
+**低置信度处理：** 本阶段不涉及；若后续接入 model/template，低于 0.6 标“需人工复核”，保留原始记录并另存 source=review 复核记录。
+
+### 4.4 与统一 JSON 的关系
+
+flowLevel 一并写入统一 JSON 状态流，随每条 MQTT 状态消息发布。感知结果记录另行保存到 Evidence/E2/，以 reachId + time 关联回状态流。

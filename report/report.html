@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>TideWatch 离线分析报告</title>
+<style>
+body { font-family: "Microsoft YaHei", sans-serif; margin: 40px; }
+table { border-collapse: collapse; margin: 20px 0; }
+th, td { border: 1px solid #ccc; padding: 8px 12px; text-align: center; }
+th { background: #f0f0f0; }
+img { max-width: 900px; display: block; margin: 20px 0; }
+</style>
+</head>
+<body>
+<h1>TideWatch 离线分析报告</h1>
+<p>数据来源：data/tidewatch_history.csv（模拟运行数据）</p>
+<p>生成时间：2026-10-03 21:28:24</p>
+
+<h2>一、按断面统计</h2>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>reachId</th>
+      <th>count</th>
+      <th>waterLevel_mean</th>
+      <th>waterLevel_max</th>
+      <th>turbidity_mean</th>
+      <th>turbidity_max</th>
+      <th>abnormal_count</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>reach-a</td>
+      <td>3</td>
+      <td>4.733333</td>
+      <td>5.0</td>
+      <td>22.333333</td>
+      <td>25</td>
+      <td>0</td>
+    </tr>
+    <tr>
+      <td>reach-b</td>
+      <td>3</td>
+      <td>8.200000</td>
+      <td>9.0</td>
+      <td>20.666667</td>
+      <td>22</td>
+      <td>3</td>
+    </tr>
+    <tr>
+      <td>reach-c</td>
+      <td>3</td>
+      <td>4.633333</td>
+      <td>4.8</td>
+      <td>75.000000</td>
+      <td>80</td>
+      <td>3</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>二、水位趋势</h2>
+<img src="img/water_level_trend.png" alt="水位趋势">
+
+<h2>三、浊度趋势</h2>
+<img src="img/turbidity_trend.png" alt="浊度趋势">
+
+<h2>四、说明</h2>
+<ul>
+<li>本报告由 python/analyze.py 自动生成，请勿手工修改。</li>
+<li>判级规则：waterLevel>=8.5 洪水预警；否则>=7.0 高水位警戒；否则 turbidity>=60 水质浑浊；否则正常。</li>
+<li>数据为模拟运行数据，不代表真实水文情况。</li>
+</ul>
+</body>
+</html>

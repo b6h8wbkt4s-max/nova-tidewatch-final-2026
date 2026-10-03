@@ -14,6 +14,11 @@ h1 { color: #333; }
 .card.水质浑浊 { border-color: purple; background: #f4ecff; }
 .card.正常 { border-color: green; background: #ecfff0; }
 .card.priority { border-color: #1a73e8; box-shadow: 0 0 0 3px #1a73e8, 0 4px 12px rgba(0,0,0,.25); }
+.event { border: 2px solid #ccc; border-radius: 8px; padding: 12px; margin: 12px 0; background: white; }
+.event.OPEN { border-color: red; background: #ffecec; }
+.event.HANDLING { border-color: orange; background: #fff4e0; }
+.event.RECOVERED { border-color: green; background: #ecfff0; }
+.event p { margin: 4px 0; }
 .card h2 { margin: 0 0 8px 0; }
 .card p { margin: 4px 0; }
 </style>
@@ -24,6 +29,9 @@ h1 { color: #333; }
 <p>当前优先关注：<strong id="priorityTarget">暂无</strong><span id="priorityScore"></span></p>
 <div id="cards"></div>
 
+<h2>事件列表</h2>
+<div id="events"></div>
+
 <script src="mqtt.min.js"></script>
 <script>
 const BROKER_WS = "ws://localhost:8083";
@@ -32,6 +40,8 @@ const TOPIC = "tidewatch/+/state";
 const state = {};
 const anomalyStreak = {}; // reachId -> 连续异常次数
 const ENV_SCORE = { "洪水预警": 3, "高水位警戒": 2, "水质浑浊": 1, "正常": 0 };
+const events = [];
+const openEventByReach = {}; // reachId -> 未关闭事件（OPEN/HANDLING），防重复创建
 
 if (typeof mqtt === "undefined") {
   const el = document.getElementById("status");
@@ -62,12 +72,41 @@ client.on("message", (topic, message) => {
     return;
   }
   if (!data.reachId || typeof data.status !== "string") return;
+
+  const prev = state[data.reachId];
+  const wasNormal = !prev || prev.status === "正常";
+
   if (data.status === "正常") {
     anomalyStreak[data.reachId] = 0;
   } else {
     anomalyStreak[data.reachId] = (anomalyStreak[data.reachId] || 0) + 1;
   }
   state[data.reachId] = data;
+
+  // D3-1：正常 → 非正常，且该断面无未关闭事件 → 创建 OPEN 事件
+  if (data.status !== "正常" && wasNormal && !openEventByReach[data.reachId]) {
+    const sc = scoreOf(data.reachId);
+    const problem = [];
+    if (data.status === "洪水预警" || data.status === "高水位警戒") problem.push("水位异常");
+    if (data.status === "水质浑浊") problem.push("水质异常");
+    if ((data.flowLevel ?? 0) >= 2) problem.push("水流异常");
+    const totals = Object.values(state).map(d => scoreOf(d.reachId).total);
+    const uniqueTop = sc.total === Math.max(...totals) && totals.filter(t => t === sc.total).length === 1;
+    const ev = {
+      event_id: "evt-" + data.reachId + "-" + data.time.replace(/[- :]/g, ""),
+      reachId: data.reachId,
+      start_time: data.time,
+      problem,
+      priority_reason: `优先分 ${sc.total}（环境 ${sc.env} + 感知 ${sc.perc} + 持续 ${sc.persist}）` + (uniqueTop ? "，当前优先关注" : ""),
+      action: null,
+      verify_data: null,
+      state: "OPEN",
+      recover_time: null,
+    };
+    events.push(ev);
+    openEventByReach[data.reachId] = ev;
+  }
+
   render();
 });
 
@@ -107,6 +146,29 @@ function render() {
       <p>优先分：${sc.total}（环境 ${sc.env} + 感知 ${sc.perc} + 持续 ${sc.persist}）</p>
       <p>连续异常：${sc.streak} 次</p>
       <p>时间：${d.time}</p>
+    `;
+    container.appendChild(div);
+  });
+
+  renderEvents();
+}
+
+function renderEvents() {
+  const container = document.getElementById("events");
+  container.innerHTML = "";
+  if (events.length === 0) {
+    container.innerHTML = "<p>暂无事件</p>";
+    return;
+  }
+  events.forEach(ev => {
+    const div = document.createElement("div");
+    div.className = "event " + ev.state;
+    div.innerHTML = `
+      <p><strong>${ev.event_id}</strong> <span>[${ev.state}]</span></p>
+      <p>断面：${ev.reachId}</p>
+      <p>问题：${ev.problem.join("、")}</p>
+      <p>关注理由：${ev.priority_reason}</p>
+      <p>开始时间：${ev.start_time}</p>
     `;
     container.appendChild(div);
   });

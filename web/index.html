@@ -19,6 +19,10 @@ h1 { color: #333; }
 .event.HANDLING { border-color: orange; background: #fff4e0; }
 .event.RECOVERED { border-color: green; background: #ecfff0; }
 .event p { margin: 4px 0; }
+.event button { margin-top: 8px; padding: 6px 12px; cursor: pointer; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 10; }
+.modal { background: white; padding: 24px; border-radius: 8px; }
+.modal button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
 .card h2 { margin: 0 0 8px 0; }
 .card p { margin: 4px 0; }
 </style>
@@ -31,6 +35,17 @@ h1 { color: #333; }
 
 <h2>事件列表</h2>
 <div id="events"></div>
+
+<div id="actionModal" class="modal-backdrop" style="display:none;">
+  <div class="modal">
+    <h3>选择干预动作</h3>
+    <p id="actionModalInfo"></p>
+    <button data-action="开闸泄洪">开闸泄洪</button>
+    <button data-action="开启泵站">开启泵站</button>
+    <button data-action="投加净水剂">投加净水剂</button>
+    <button id="actionCancel">取消</button>
+  </div>
+</div>
 
 <script src="mqtt.min.js"></script>
 <script>
@@ -169,10 +184,40 @@ function renderEvents() {
       <p>问题：${ev.problem.join("、")}</p>
       <p>关注理由：${ev.priority_reason}</p>
       <p>开始时间：${ev.start_time}</p>
+      ${ev.state === "HANDLING" ? `<p>处理中：${ev.action}</p>` : ""}
     `;
+    if (ev.state === "OPEN") {
+      const btn = document.createElement("button");
+      btn.textContent = "开始干预";
+      btn.addEventListener("click", () => openActionModal(ev));
+      div.appendChild(btn);
+    }
     container.appendChild(div);
   });
 }
+
+let pendingEventId = null;
+
+function openActionModal(ev) {
+  pendingEventId = ev.event_id;
+  document.getElementById("actionModalInfo").textContent = `断面 ${ev.reachId} · ${ev.event_id}`;
+  document.getElementById("actionModal").style.display = "flex";
+}
+
+// 只在点到 data-action 按钮时才改状态；取消/点背景只关闭弹窗
+document.getElementById("actionModal").addEventListener("click", (e) => {
+  const action = e.target.getAttribute("data-action");
+  if (action) {
+    const ev = events.find(x => x.event_id === pendingEventId);
+    if (ev && ev.state === "OPEN") {
+      ev.action = action;
+      ev.state = "HANDLING";
+    }
+  }
+  pendingEventId = null;
+  document.getElementById("actionModal").style.display = "none";
+  render();
+});
 </script>
 </body>
 </html>

@@ -87,3 +87,19 @@
 ### 4.4 与统一 JSON 的关系
 
 flowLevel 一并写入统一 JSON 状态流，随每条 MQTT 状态消息发布。感知结果记录另行保存到 Evidence/E2/，以 reachId + time 关联回状态流。
+## 5. MQTT / Topic 结构
+
+| 用途 | Topic | 说明 |
+|---|---|---|
+| 断面状态 | `tidewatch/{reachId}/state` | 每个断面一条 |
+| 事件更新 | `tidewatch/event/update` | 事件状态变化 |
+| 干预动作 | `tidewatch/intervention` | 用户干预 |
+
+**Broker 地址：** localhost
+**MQTT 端口：** 1883
+**WebSocket 端口：** 8083
+**QoS：** 1
+
+**订阅方式：** Web / 移动端 / 地图3D 订阅 `tidewatch/+/state`，一次订阅三个断面。
+
+**消息去重依据：** 优先使用 `message_id`；若无，则用 `reachId + time + waterLevel + turbidity + flowLevel` 的哈希。event_id 只用于标识事件，不用于消息去重。

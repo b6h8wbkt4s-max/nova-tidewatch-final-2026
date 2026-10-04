@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TideWatch 移动端</title>
+<style>
+body { font-family: "Microsoft YaHei", sans-serif; margin: 0 auto; max-width: 480px; padding: 16px; background: #f5f6f8; }
+h1 { font-size: 20px; color: #333; }
+h2 { margin: 0 0 8px 0; font-size: 16px; }
+#status { font-weight: bold; }
+#priorityTarget { color: #d32f2f; }
+.card { border: 2px solid #ccc; border-radius: 12px; padding: 16px; margin: 12px 0; background: white; }
+.card p { margin: 6px 0; font-size: 15px; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 4px; font-weight: bold; color: white; }
+.badge.洪水预警 { background: red; }
+.badge.高水位警戒 { background: orange; }
+.badge.水质浑浊 { background: purple; }
+.badge.正常 { background: green; }
+.badge.OPEN { background: red; }
+.badge.HANDLING { background: orange; }
+.badge.RECOVERED { background: green; }
+.btn { display: block; width: 100%; margin: 10px 0; padding: 14px; font-size: 16px; border-radius: 8px; border: none; background: #1a73e8; color: white; cursor: pointer; }
+.btn:active { background: #1557b0; }
+.muted { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>TideWatch 现场巡查</h1>
+<p>连接状态：<span id="status">未连接</span></p>
+<p>当前优先关注：<strong id="priorityTarget">暂无</strong><span id="priorityScore"></span></p>
+
+<div class="card" id="dataCard"><h2>环境与感知</h2><p class="muted">等待数据…</p></div>
+<div class="card" id="eventCard"><h2>事件</h2><p class="muted">暂无事件</p></div>
+<div class="card" id="actionCard" style="display:none;"><h2>干预操作</h2></div>
+
+<script src="mqtt.min.js"></script>
+<script>
+const BROKER_WS = "ws://localhost:8083";
+const TOPIC = "tidewatch/+/state";
+
+const state = {};
+const anomalyStreak = {};
+const ENV_SCORE = { "洪水预警": 3, "高水位警戒": 2, "水质浑浊": 1, "正常": 0 };
+const FLOW_TEXT = { 0: "缓流", 1: "平稳", 2: "湍急", 3: "湍流" };
+const events = [];
+const openEventByReach = {};
+const seenKeys = new Set();
+const latestTimeByReach = {};
+
+if (typeof mqtt === "undefined") {
+  const el = document.getElementById("status");
+  el.textContent = "mqtt.js 加载失败";
+  el.style.color = "red";
+  throw new Error("mqtt.js 加载失败");
+}
+
+const client = mqtt.connect(BROKER_WS);
+
+client.on("connect", () => {
+  document.getElementById("status").textContent = "已连接";
+  document.getElementById("status").style.color = "green";
+  client.subscribe(TOPIC);
+  client.subscribe("tidewatch/event/update", { qos: 1 });
+  client.subscribe("tidewatch/intervention", { qos: 1 });
+});
+
+client.on("error", (err) => {
+  document.getElementById("status").textContent = "连接失败：" + err.message;
+  document.getElementById("status").style.color = "red";
+});
+
+function msgHash(d) {
+  return d.reachId + "|" + d.time + "|" + d.waterLevel + "|" + d.turbidity + "|" + (d.flowLevel ?? "");
+}
+
+client.on("message", (topic, message) => {
+  let data;
+  try {
+    data = JSON.parse(message.toString());
+  } catch (e) {
+    console.error("JSON 解析失败", message.toString());
+    return;
+  }
+  if (topic === "tidewatch/event/update") {
+    handleEventUpdate(data, message.toString());
+    return;
+  }
+  if (topic === "tidewatch/intervention") {
+    handleIntervention(data, message.toString());
+    return;
+  }
+  handleMessage(data);
+});
+
+function handleMessage(data) {
+  // 数据质量前置：缺字段/时钟异常直接丢弃
+  if (!data.reachId || typeof data.status !== "string" ||
+      typeof data.waterLevel !== "number" || typeof data.turbidity !== "number") return;
+  if (typeof data.time !== "string" ||
+      !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(data.time) ||
+      isNaN(Date.parse(data.time.replace(" ", "T")))) return;
+
+  // 去重：优先 message_id，否则载荷哈希
+  const hashKey = "h:" + msgHash(data);
+  const idKey = data.message_id ? "m:" + data.message_id : null;
+  if ((idKey && seenKeys.has(idKey)) || seenKeys.has(hashKey)) return;
+  seenKeys.add(hashKey);
+  if (idKey) seenKeys.add(idKey);
+
+  // 乱序/迟到：旧消息不覆盖新状态、不动事件
+  const latest = latestTimeByReach[data.reachId];
+  if (latest !== undefined && data.time <= latest) return;
+  latestTimeByReach[data.reachId] = data.time;
+
+  const prev = state[data.reachId];
+  const wasNormal = !prev || prev.status === "正常";
+
+  if (data.status === "正常") {
+    anomalyStreak[data.reachId] = 0;
+  } else {
+    anomalyStreak[data.reachId] = (anomalyStreak[data.reachId] || 0) + 1;
+  }
+  state[data.reachId] = data;
+
+  // 正常 → 非正常，且无未关闭事件 → 创建 OPEN
+  if (data.status !== "正常" && wasNormal && !openEventByReach[data.reachId]) {
+    const sc = scoreOf(data.reachId);
+    const problem = [];
+    if (data.status === "洪水预警" || data.status === "高水位警戒") problem.push("水位异常");
+    if (data.status === "水质浑浊") problem.push("水质异常");
+    if ((data.flowLevel ?? 0) >= 2) problem.push("水流异常");
+    const ev = {
+      event_id: "evt-" + data.reachId + "-" + data.time.replace(/[- :]/g, ""),
+      reachId: data.reachId,
+      start_time: data.time,
+      problem,
+      priority_reason: `优先分 ${sc.total}（环境 ${sc.env} + 感知 ${sc.perc} + 持续 ${sc.persist}）`,
+      action: null,
+      verify_data: [],
+      state: "OPEN",
+      recover_time: null,
+    };
+    events.push(ev);
+    openEventByReach[data.reachId] = ev;
+  }
+
+  // HANDLING 恢复判定，只能由新数据触发
+  const ev = openEventByReach[data.reachId];
+  if (ev && ev.state === "HANDLING") {
+    ev.verify_data.push({ time: data.time, waterLevel: data.waterLevel, turbidity: data.turbidity, flowLevel: data.flowLevel, status: data.status });
+    if (checkRecovery(ev, data)) {
+      ev.state = "RECOVERED";
+      ev.recover_time = data.time;
+      delete openEventByReach[data.reachId];
+    }
+  }
+
+  render();
+}
+
+// E3 跨端同步（contract 第 5 节）：订阅 Web 事件广播与两端干预
+const seenEventKeys = new Set();
+const STATE_ORDER = { OPEN: 1, HANDLING: 2, RECOVERED: 3 };
+
+function handleEventUpdate(data, raw) {
+  if (!data || typeof data.event_id !== "string" || !data.reachId ||
+      typeof data.state !== "string" || !(data.state in STATE_ORDER)) return;
+  const key = data.message_id ? "m:" + data.message_id : "s:" + raw;
+  if (seenEventKeys.has(key)) return;
+  seenEventKeys.add(key);
+  const existing = events.find(e => e.event_id === data.event_id);
+  // 契约 6.3：迟到/重复消息不回退状态（RECOVERED 不被改回，HANDLING 不被降回 OPEN）
+  if (existing && STATE_ORDER[data.state] < STATE_ORDER[existing.state]) return;
+  let ev;
+  if (existing) {
+    Object.assign(existing, data);
+    ev = existing;
+  } else {
+    ev = { ...data };
+    events.push(ev);
+  }
+  if (ev.state === "RECOVERED") {
+    delete openEventByReach[ev.reachId];
+  } else {
+    openEventByReach[ev.reachId] = ev;
+  }
+  render();
+}
+
+function handleIntervention(data, raw) {
+  if (!data || typeof data.event_id !== "string" || typeof data.action !== "string") return;
+  const key = data.message_id ? "m:" + data.message_id : "s:" + raw;
+  if (seenEventKeys.has(key)) return;
+  seenEventKeys.add(key);
+  const ev = events.find(e => e.event_id === data.event_id);
+  if (!ev) return;
+  if (ev.state === "RECOVERED") return; // 契约 6.3
+  if (ev.state === "HANDLING" && ev.action === data.action) return; // 幂等
+  ev.action = data.action;
+  ev.state = "HANDLING";
+  render();
+}
+
+function scoreOf(reachId) {
+  const d = state[reachId];
+  const env = ENV_SCORE[d.status] || 0;
+  const perc = d.flowLevel ?? 0;
+  const streak = anomalyStreak[reachId] || 0;
+  const persist = streak >= 3 ? 2 : (streak >= 1 ? 1 : 0);
+  return { env, perc, persist, streak, total: env + perc + persist };
+}
+
+function checkRecovery(ev, data) {
+  if (ev.problem.includes("水位异常") && data.waterLevel >= 7.0) return false;
+  if (ev.problem.includes("水质异常") && data.turbidity >= 60) return false;
+  if (ev.problem.includes("水流异常") && (data.flowLevel ?? 0) > 1) return false;
+  return true;
+}
+
+function topReach() {
+  let top = null;
+  Object.values(state).forEach(d => {
+    const total = scoreOf(d.reachId).total;
+    if (!top || total > top.total) top = { reachId: d.reachId, total };
+  });
+  return top;
+}
+
+function lastEventOf(reachId) {
+  return events.filter(e => e.reachId === reachId).pop();
+}
+
+function intervene(ev, action) {
+  if (ev.state !== "OPEN") return;
+  ev.action = action;
+  ev.state = "HANDLING";
+  client.publish("tidewatch/intervention",
+    JSON.stringify({ event_id: ev.event_id, reachId: ev.reachId, action }), { qos: 1 });
+  render();
+}
+
+function render() {
+  const top = topReach();
+  const priorityTarget = document.getElementById("priorityTarget");
+  const priorityScore = document.getElementById("priorityScore");
+  if (top) {
+    priorityTarget.textContent = top.reachId;
+    priorityScore.textContent = `（优先分 ${top.total}）`;
+  }
+
+  // 中部：当前重点断面的最新环境与感知结论
+  const dataCard = document.getElementById("dataCard");
+  if (top && state[top.reachId]) {
+    const d = state[top.reachId];
+    dataCard.innerHTML = `
+      <h2>环境与感知 · ${d.reachId}</h2>
+      <p>状态：<span class="badge ${d.status}">${d.status}</span></p>
+      <p>水位：${d.waterLevel} m</p>
+      <p>浊度：${d.turbidity} NTU</p>
+      <p>水流：${FLOW_TEXT[d.flowLevel] ?? d.flowLevel}</p>
+      <p>时间：${d.time}</p>
+    `;
+  } else {
+    dataCard.innerHTML = `<h2>环境与感知</h2><p class="muted">等待数据…</p>`;
+  }
+
+  // 下部：该断面的活跃事件；RECOVERED 显示已恢复
+  const eventCard = document.getElementById("eventCard");
+  const actionCard = document.getElementById("actionCard");
+  if (top) {
+    const ev = openEventByReach[top.reachId] || lastEventOf(top.reachId);
+    if (ev) {
+      const stateText = ev.state === "OPEN" ? "待处理" : ev.state === "HANDLING" ? "处理中" : "已恢复";
+      eventCard.innerHTML = `
+        <h2>事件 · ${ev.reachId}</h2>
+        <p><span class="badge ${ev.state}">${stateText}</span></p>
+        <p>问题：${ev.problem.join("、")}</p>
+        <p>开始：${ev.start_time}</p>
+        ${ev.state === "HANDLING" ? `<p>处置：${ev.action}</p>` : ""}
+        ${ev.state === "RECOVERED" ? `<p>恢复：${ev.recover_time}</p>` : ""}
+      `;
+      actionCard.style.display = ev.state === "OPEN" ? "block" : "none";
+      if (ev.state === "OPEN") {
+        actionCard.innerHTML = `
+          <h2>干预操作</h2>
+          <button class="btn" data-action="开闸泄洪">开闸泄洪</button>
+          <button class="btn" data-action="开启泵站">开启泵站</button>
+          <button class="btn" data-action="投加净水剂">投加净水剂</button>
+        `;
+        actionCard.querySelectorAll(".btn").forEach(b => {
+          b.addEventListener("click", () => intervene(ev, b.getAttribute("data-action")));
+        });
+      }
+    } else {
+      eventCard.innerHTML = `<h2>事件 · ${top.reachId}</h2><p class="muted">暂无异常事件</p>`;
+      actionCard.style.display = "none";
+    }
+  } else {
+    eventCard.innerHTML = `<h2>事件</h2><p class="muted">暂无事件</p>`;
+    actionCard.style.display = "none";
+  }
+}
+</script>
+</body>
+</html>

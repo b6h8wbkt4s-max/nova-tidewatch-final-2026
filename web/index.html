@@ -87,6 +87,7 @@ client.on("connect", () => {
   document.getElementById("status").textContent = "已连接";
   document.getElementById("status").style.color = "green";
   client.subscribe(TOPIC);
+  client.subscribe("tidewatch/intervention", { qos: 1 });
 });
 
 client.on("error", (err) => {
@@ -100,8 +101,14 @@ client.on("message", (topic, message) => {
     data = JSON.parse(message.toString());
   } catch (e) {
     console.error("JSON 解析失败", message.toString());
-    rejectedCount++;
-    render();
+    if (topic.endsWith("/state")) {
+      rejectedCount++;
+      render();
+    }
+    return;
+  }
+  if (topic === "tidewatch/intervention") {
+    handleIntervention(data, message.toString());
     return;
   }
   handleMessage(data);
@@ -185,6 +192,7 @@ function handleMessage(data) {
     };
     events.push(ev);
     openEventByReach[data.reachId] = ev;
+    publishEventUpdate(ev);
   }
 
   // D3-3：HANDLING 事件的恢复判定，只能由新数据触发
@@ -201,9 +209,53 @@ function handleMessage(data) {
       ev.state = "RECOVERED";
       ev.recover_time = data.time;
       delete openEventByReach[data.reachId];
+      publishEventUpdate(ev);
     }
   }
 
+  render();
+}
+
+// E3 事件广播 / 干预同步（contract 第 5 节）
+const seenEventKeys = new Set(); // 事件类消息去重：优先 message_id，否则整条载荷
+
+function publishEventUpdate(ev) {
+  client.publish("tidewatch/event/update", JSON.stringify({
+    event_id: ev.event_id,
+    reachId: ev.reachId,
+    start_time: ev.start_time,
+    problem: ev.problem,
+    priority_reason: ev.priority_reason,
+    action: ev.action,
+    verify_data: ev.verify_data,
+    state: ev.state,
+    recover_time: ev.recover_time,
+  }), { qos: 1 });
+}
+
+function publishIntervention(ev, action) {
+  client.publish("tidewatch/intervention",
+    JSON.stringify({ event_id: ev.event_id, reachId: ev.reachId, action }), { qos: 1 });
+}
+
+function handleIntervention(data, raw) {
+  if (!data || typeof data.event_id !== "string" || typeof data.action !== "string") return;
+  const key = data.message_id ? "m:" + data.message_id : "s:" + raw;
+  if (seenEventKeys.has(key)) return;
+  seenEventKeys.add(key);
+  const ev = events.find(x => x.event_id === data.event_id);
+  if (!ev) {
+    console.warn("收到未知事件的干预：", data.event_id);
+    return;
+  }
+  if (ev.state === "RECOVERED") {
+    console.warn("已恢复事件不接受干预：", data.event_id);
+    return;
+  }
+  if (ev.state === "HANDLING" && ev.action === data.action) return; // 幂等，不回广播
+  ev.action = data.action;
+  ev.state = "HANDLING";
+  publishEventUpdate(ev);
   render();
 }
 
@@ -310,6 +362,8 @@ document.getElementById("actionModal").addEventListener("click", (e) => {
     if (ev && ev.state === "OPEN") {
       ev.action = action;
       ev.state = "HANDLING";
+      publishEventUpdate(ev);
+      publishIntervention(ev, action);
     }
   }
   pendingEventId = null;

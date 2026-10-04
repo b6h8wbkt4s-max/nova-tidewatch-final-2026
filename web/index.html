@@ -25,6 +25,7 @@ h1 { color: #333; }
 .modal button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
 #testPanel button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
 #msgStats { color: #666; font-size: 14px; }
+#rejectReason { color: #c62828; font-size: 13px; }
 .card h2 { margin: 0 0 8px 0; }
 .card p { margin: 4px 0; }
 </style>
@@ -37,6 +38,7 @@ h1 { color: #333; }
 
 <h2>事件列表</h2>
 <p id="msgStats">已处理消息：0 · 重复丢弃：0 · 乱序/迟到：0 · 拒绝：0</p>
+<p id="rejectReason">最近拒绝：—</p>
 <div id="events"></div>
 
 <h2>测试面板</h2>
@@ -45,6 +47,8 @@ h1 { color: #333; }
   <button id="btnDup">重复发送最近消息</button>
   <button id="btnOld">发送旧数据（time 提前 10 分钟）</button>
   <button id="btnMsgId">发送带 message_id 的消息</button>
+  <button id="btnWrongTopic">发送错误 Topic</button>
+  <button id="btnBadJson">发送错误 JSON</button>
 </div>
 
 <div id="actionModal" class="modal-backdrop" style="display:none;">
@@ -72,6 +76,8 @@ const seenKeys = new Set();   // 去重键：m:message_id 或 h:载荷哈希
 const latestTimeByReach = {}; // 断面最新 time，乱序判断基准
 const lateMessages = [];      // 迟到消息历史补充（F12 可查，最多 10 条）
 let processedCount = 0, dupCount = 0, lateCount = 0, rejectedCount = 0;
+let lastRejectReason = null;
+const KNOWN_REACHES = ["reach-a", "reach-b", "reach-c"];
 let lastProcessed = null;     // 最近一条已处理消息，供测试面板使用
 
 if (typeof mqtt === "undefined") {
@@ -103,12 +109,22 @@ client.on("message", (topic, message) => {
     console.error("JSON 解析失败", message.toString());
     if (topic.endsWith("/state")) {
       rejectedCount++;
+      lastRejectReason = "JSON 格式错误";
       render();
     }
     return;
   }
   if (topic === "tidewatch/intervention") {
     handleIntervention(data, message.toString());
+    return;
+  }
+  // D4：写错 Topic —— topic 断面段不合法则拒绝，不进入状态处理
+  const m = topic.match(/^tidewatch\/(.+)\/state$/);
+  if (m && KNOWN_REACHES.indexOf(m[1]) < 0) {
+    console.warn("错误 Topic 被拒绝：", topic);
+    rejectedCount++;
+    lastRejectReason = "Topic 错误：" + topic;
+    render();
     return;
   }
   handleMessage(data);
@@ -124,6 +140,7 @@ function handleMessage(data) {
   if (!data.reachId || typeof data.status !== "string" ||
       typeof data.waterLevel !== "number" || typeof data.turbidity !== "number") {
     rejectedCount++;
+    lastRejectReason = "缺字段";
     render();
     return;
   }
@@ -132,6 +149,7 @@ function handleMessage(data) {
       !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(data.time) ||
       isNaN(Date.parse(data.time.replace(" ", "T")))) {
     rejectedCount++;
+    lastRejectReason = "时钟异常";
     render();
     return;
   }
@@ -279,6 +297,8 @@ function checkRecovery(ev, data) {
 function render() {
   document.getElementById("msgStats").textContent =
     `已处理消息：${processedCount} · 重复丢弃：${dupCount} · 乱序/迟到：${lateCount} · 拒绝：${rejectedCount}`;
+  document.getElementById("rejectReason").textContent =
+    lastRejectReason ? `最近拒绝：${lastRejectReason}` : "最近拒绝：—";
   document.getElementById("testLastMsg").textContent = lastProcessed
     ? `最近消息：${lastProcessed.reachId} ${lastProcessed.time} 水位${lastProcessed.waterLevel} 浊度${lastProcessed.turbidity} flow${lastProcessed.flowLevel}`
     : "最近消息：暂无";
@@ -390,6 +410,25 @@ document.getElementById("btnMsgId").addEventListener("click", () => {
   if (!lastProcessed) { alert("还没有已处理消息"); return; }
   // 水位 +0.1 使载荷哈希不同，第一次正常处理；再点一次被 message_id 拦下
   handleMessage({ ...lastProcessed, message_id: "test-msg-1", waterLevel: lastProcessed.waterLevel + 0.1 });
+});
+
+// D4 故障演示（contract 第 11 节）：真实 MQTT 注入故障消息
+document.getElementById("btnWrongTopic").addEventListener("click", () => {
+  // 写错 Topic：内容正常但发到不存在的断面 topic；带旧时间戳，
+  // 即使落到没有 topic 校验的订阅端也会被乱序守卫丢弃，双保险不污染状态
+  client.publish("tidewatch/wrong-topic/state", JSON.stringify({
+    reachId: "reach-a",
+    waterLevel: 4.5,
+    turbidity: 20,
+    flowLevel: 0,
+    status: "正常",
+    time: "2000-01-01 00:00:00",
+  }), { qos: 1 });
+});
+
+document.getElementById("btnBadJson").addEventListener("click", () => {
+  // 错误 JSON：格式非法，解析失败被拒绝
+  client.publish("tidewatch/reach-a/state", "{reachId: reach-a, waterLevel: }", { qos: 1 });
 });
 </script>
 </body>

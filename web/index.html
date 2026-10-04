@@ -26,6 +26,10 @@ h1 { color: #333; }
 #testPanel button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
 #msgStats { color: #666; font-size: 14px; }
 #rejectReason { color: #c62828; font-size: 13px; }
+#d5Table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; }
+#d5Table th, #d5Table td { border: 1px solid #ddd; padding: 6px 8px; text-align: center; }
+#d5Table th { background: #f5f6f8; }
+#d5Table tr.inconsistent td { background: #ffebee; color: #c62828; font-weight: bold; }
 .muted { color: #666; font-size: 13px; }
 .card.viewing { outline: 3px solid #1a73e8; outline-offset: 2px; }
 .perc { border: 1px solid #ccc; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fafafa; }
@@ -55,6 +59,17 @@ h1 { color: #333; }
   <button id="btnMsgId">发送带 message_id 的消息</button>
   <button id="btnWrongTopic">发送错误 Topic</button>
   <button id="btnBadJson">发送错误 JSON</button>
+</div>
+
+<h2>D5 规则/ML 对照</h2>
+<div id="d5Section">
+  <p class="muted">组合裁决权重：规则 <span id="d5RuleW">0.7</span> / ML <span id="d5MlW">0.3</span>（contract 8.1，代码中可临时调整）</p>
+  <p id="d5Status" class="muted">对照数据加载中…</p>
+  <table id="d5Table">
+    <thead><tr><th>断面</th><th>水位</th><th>浊度</th><th>规则判断</th><th>ML 判断</th><th>一致</th><th>组合裁决</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="d5Cases"></div>
 </div>
 
 <h2>多模态交互</h2>
@@ -373,6 +388,7 @@ function render() {
     container.appendChild(div);
   });
 
+  renderD5Table();
   renderEvents();
 }
 
@@ -654,6 +670,88 @@ document.getElementById("btnSavePhoto").addEventListener("click", () => {
   a.download = photo.imageId + ".png";
   a.click();
 });
+
+/* ---------- D5 规则/ML 对照（contract 第 8 节） ---------- */
+const RULE_WEIGHT = 0.7; // 8.1 默认权重，可临时修改验证裁决变化
+const ML_WEIGHT = 0.3;
+let d5Data = null;
+
+fetch("./d5_compare.json")
+  .then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+  .then(data => {
+    d5Data = data;
+    const s = data.summary || {};
+    document.getElementById("d5RuleW").textContent = data.rule_weight;
+    document.getElementById("d5MlW").textContent = data.ml_weight;
+    document.getElementById("d5Status").textContent =
+      `对照数据已加载（${s.total} 条 · 不一致 ${s.inconsistent} 条 · ${data.model}）`;
+    renderD5Cases();
+    render();
+  })
+  .catch(() => {
+    document.getElementById("d5Status").textContent =
+      "对照数据加载失败：请先运行 python python/ml_detect.py，并用本地静态服务器打开本页（python -m http.server 8000 → http://localhost:8000/web/index.html）";
+    render();
+  });
+
+function d5Lookup(reachId, d) {
+  if (!d5Data) return null;
+  for (const r of d5Data.records || []) {
+    if (r.reachId === reachId && r.waterLevel === d.waterLevel &&
+        r.turbidity === d.turbidity && r.flowLevel === d.flowLevel) return r;
+  }
+  return null;
+}
+
+// contract 8.3 组合裁决：规则 0.7 + ML 0.3；规则正常 + ML 明显异常 → 需人工复核
+function d5Verdict(ruleStatus, mlLabel) {
+  const mlGrade = { "明显异常": 1, "偏离历史": 0.66, "略偏": 0.33, "接近历史": 0 }[mlLabel];
+  if (mlGrade === undefined) return null;
+  const ruleAb = ruleStatus !== "正常";
+  if (!ruleAb && mlLabel === "明显异常") {
+    return { text: "需人工复核", score: +(ML_WEIGHT * 1).toFixed(2) };
+  }
+  const score = +(RULE_WEIGHT * (ruleAb ? 1 : 0) + ML_WEIGHT * mlGrade).toFixed(2);
+  return { text: score >= 0.5 ? "异常" : "正常", score };
+}
+
+function renderD5Table() {
+  const tbody = document.querySelector("#d5Table tbody");
+  if (!tbody) return;
+  const rows = KNOWN_REACHES.filter(id => state[id]).map(id => {
+    const d = state[id];
+    const rec = d5Lookup(id, d);
+    const ml = rec ? rec.status_ml : "—";
+    const consistent = rec ? (rec.is_consistent ? "一致" : "不一致") : "—";
+    const verdict = rec ? d5Verdict(d.status, rec.status_ml) : null;
+    const inconsistent = rec && rec.is_consistent === false;
+    return `<tr class="${inconsistent ? "inconsistent" : ""}">
+      <td>${id}</td>
+      <td>${d.waterLevel}</td>
+      <td>${d.turbidity}</td>
+      <td>${d.status}</td>
+      <td>${ml}</td>
+      <td>${consistent}</td>
+      <td>${verdict ? `${verdict.text}（${verdict.score}）` : "—"}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = rows.join("");
+}
+
+function renderD5Cases() {
+  const el = document.getElementById("d5Cases");
+  if (!el) return;
+  if (!d5Data) { el.innerHTML = ""; return; }
+  const cases = (d5Data.records || []).filter(r => r.constructed);
+  if (!cases.length) { el.innerHTML = ""; return; }
+  el.innerHTML = "<h3>值得分析的不一致案例（构造样本，已标注）</h3>" + cases.map(c => `
+    <div class="perc" style="${c.is_consistent === false ? "border-color:#c62828;background:#ffebee;" : ""}">
+      <p><b>${c.reachId}</b> 水位 ${c.waterLevel} / 浊度 ${c.turbidity} / flow ${c.flowLevel}</p>
+      <p>规则：${c.status_rule} · ML：${c.status_ml} · 一致：${c.is_consistent ? "是" : "否"}</p>
+      <p>${c.case_note}</p>
+    </div>
+  `).join("");
+}
 </script>
 </body>
 </html>

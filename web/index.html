@@ -24,6 +24,7 @@ h1 { color: #333; }
 .modal { background: white; padding: 24px; border-radius: 8px; }
 .modal button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
 #testPanel button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
+#testPanel input, #testPanel select { margin: 6px 8px 0 0; padding: 6px 8px; font-size: 14px; }
 #msgStats { color: #666; font-size: 14px; }
 #rejectReason { color: #c62828; font-size: 13px; }
 #d5Table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; }
@@ -59,6 +60,22 @@ h1 { color: #333; }
   <button id="btnMsgId">发送带 message_id 的消息</button>
   <button id="btnWrongTopic">发送错误 Topic</button>
   <button id="btnBadJson">发送错误 JSON</button>
+  <hr>
+  <p><b>手动发布（触发恢复/事件状态变化）</b></p>
+  <select id="manualReachId">
+    <option value="reach-a">reach-a</option>
+    <option value="reach-b">reach-b</option>
+    <option value="reach-c">reach-c</option>
+  </select>
+  <input id="manualWaterLevel" type="number" step="0.1" min="0" placeholder="waterLevel" value="4.5">
+  <input id="manualTurbidity" type="number" step="0.1" min="0" placeholder="turbidity" value="20">
+  <select id="manualFlowLevel">
+    <option value="0">flowLevel 0</option>
+    <option value="1">flowLevel 1</option>
+    <option value="2">flowLevel 2</option>
+    <option value="3">flowLevel 3</option>
+  </select>
+  <button id="btnManualPublish">发布</button>
 </div>
 
 <h2>D5 规则/ML 对照</h2>
@@ -485,6 +502,36 @@ document.getElementById("btnWrongTopic").addEventListener("click", () => {
 document.getElementById("btnBadJson").addEventListener("click", () => {
   // 错误 JSON：格式非法，解析失败被拒绝
   client.publish("tidewatch/reach-a/state", "{reachId: reach-a, waterLevel: }", { qos: 1 });
+});
+
+// 手动发布：status 按 contract 第 3 节判级规则计算，不能手填
+function makeStatus(waterLevel, turbidity) {
+  if (waterLevel >= 8.5) return "洪水预警";
+  if (waterLevel >= 7.0) return "高水位警戒";
+  if (turbidity >= 60) return "水质浑浊";
+  return "正常";
+}
+
+document.getElementById("btnManualPublish").addEventListener("click", () => {
+  const reachId = document.getElementById("manualReachId").value;
+  const waterLevel = Number(document.getElementById("manualWaterLevel").value);
+  const turbidity = Number(document.getElementById("manualTurbidity").value);
+  const flowLevel = Number(document.getElementById("manualFlowLevel").value);
+  if (!Number.isFinite(waterLevel) || !Number.isFinite(turbidity)) {
+    alert("waterLevel / turbidity 必须是数字");
+    return;
+  }
+  const p = n => String(n).padStart(2, "0");
+  const now = new Date();
+  const payload = {
+    reachId,
+    waterLevel,
+    turbidity,
+    flowLevel,
+    status: makeStatus(waterLevel, turbidity),
+    time: `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`,
+  };
+  client.publish(`tidewatch/${reachId}/state`, JSON.stringify(payload), { qos: 1 });
 });
 
 /* ---------- 多模态交互（contract 第 4 节 / E2） ---------- */

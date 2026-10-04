@@ -26,6 +26,12 @@ h1 { color: #333; }
 #testPanel button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
 #msgStats { color: #666; font-size: 14px; }
 #rejectReason { color: #c62828; font-size: 13px; }
+.muted { color: #666; font-size: 13px; }
+.card.viewing { outline: 3px solid #1a73e8; outline-offset: 2px; }
+.perc { border: 1px solid #ccc; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fafafa; }
+.perc p { margin: 2px 0; font-size: 13px; }
+#photoThumbs img { height: 56px; margin: 4px; border-radius: 4px; border: 1px solid #ccc; }
+#multiModal button { margin: 6px 8px 0 0; padding: 8px 14px; font-size: 14px; cursor: pointer; }
 .card h2 { margin: 0 0 8px 0; }
 .card p { margin: 4px 0; }
 </style>
@@ -51,6 +57,29 @@ h1 { color: #333; }
   <button id="btnBadJson">发送错误 JSON</button>
 </div>
 
+<h2>多模态交互</h2>
+<div id="multiModal">
+  <p>当前查看断面：<span id="viewReach">未指定（默认优先关注断面）</span></p>
+  <button id="btnAsr">🎤 语音指令</button>
+  <button id="btnTts">🔊 朗读结论</button>
+  <button id="btnPhoto">📷 拍照记录</button>
+  <button id="btnSavePhoto" style="display:none;">保存图片</button>
+  <p id="asrResult" class="muted">语音结果：—</p>
+  <div id="photoThumbs"></div>
+  <h3>感知记录</h3>
+  <div id="perceptionList"><p class="muted">暂无记录</p></div>
+</div>
+
+<div id="cameraModal" class="modal-backdrop" style="display:none;">
+  <div class="modal">
+    <h3>拍照记录</h3>
+    <video id="cameraVideo" autoplay playsinline style="width:320px;max-width:80vw;border-radius:8px;background:#000;"></video>
+    <p id="cameraInfo" class="muted"></p>
+    <button id="btnCapture">拍照</button>
+    <button id="btnCameraCancel">取消</button>
+  </div>
+</div>
+
 <div id="actionModal" class="modal-backdrop" style="display:none;">
   <div class="modal">
     <h3>选择干预动作</h3>
@@ -70,6 +99,10 @@ const TOPIC = "tidewatch/+/state";
 const state = {};
 const anomalyStreak = {}; // reachId -> 连续异常次数
 const ENV_SCORE = { "洪水预警": 3, "高水位警戒": 2, "水质浑浊": 1, "正常": 0 };
+const FLOW_TEXT = { 0: "缓流", 1: "平稳", 2: "湍急", 3: "湍流" };
+const photos = [];
+const perceptionRecords = [];
+let currentReach = null; // ASR“查看 reach-x”选中的断面；null = 默认优先关注断面
 const events = [];
 const openEventByReach = {}; // reachId -> 未关闭事件（OPEN/HANDLING），防重复创建
 const seenKeys = new Set();   // 去重键：m:message_id 或 h:载荷哈希
@@ -294,6 +327,15 @@ function checkRecovery(ev, data) {
   return true;
 }
 
+function topReach() {
+  let top = null;
+  Object.values(state).forEach(d => {
+    const total = scoreOf(d.reachId).total;
+    if (!top || total > top.total) top = { reachId: d.reachId, total };
+  });
+  return top;
+}
+
 function render() {
   document.getElementById("msgStats").textContent =
     `已处理消息：${processedCount} · 重复丢弃：${dupCount} · 乱序/迟到：${lateCount} · 拒绝：${rejectedCount}`;
@@ -303,11 +345,7 @@ function render() {
     ? `最近消息：${lastProcessed.reachId} ${lastProcessed.time} 水位${lastProcessed.waterLevel} 浊度${lastProcessed.turbidity} flow${lastProcessed.flowLevel}`
     : "最近消息：暂无";
 
-  let top = null;
-  Object.values(state).forEach(d => {
-    const total = scoreOf(d.reachId).total;
-    if (!top || total > top.total) top = { reachId: d.reachId, total };
-  });
+  const top = topReach();
 
   if (top) {
     document.getElementById("priorityTarget").textContent = top.reachId;
@@ -319,7 +357,9 @@ function render() {
   Object.values(state).forEach(d => {
     const sc = scoreOf(d.reachId);
     const div = document.createElement("div");
-    div.className = "card " + d.status + (top && d.reachId === top.reachId ? " priority" : "");
+    div.className = "card " + d.status +
+      (top && d.reachId === top.reachId ? " priority" : "") +
+      (d.reachId === currentReach ? " viewing" : "");
     div.innerHTML = `
       <h2>${d.reachId}</h2>
       <p>水位：${d.waterLevel}</p>
@@ -429,6 +469,190 @@ document.getElementById("btnWrongTopic").addEventListener("click", () => {
 document.getElementById("btnBadJson").addEventListener("click", () => {
   // 错误 JSON：格式非法，解析失败被拒绝
   client.publish("tidewatch/reach-a/state", "{reachId: reach-a, waterLevel: }", { qos: 1 });
+});
+
+/* ---------- 多模态交互（contract 第 4 节 / E2） ---------- */
+function lastEventOf(reachId) {
+  return events.filter(e => e.reachId === reachId).pop();
+}
+
+function setCurrentReach(reachId) {
+  if (!state[reachId]) {
+    document.getElementById("asrResult").textContent = `断面 ${reachId} 暂无数据`;
+    return;
+  }
+  currentReach = reachId;
+  document.getElementById("viewReach").textContent = reachId;
+  document.getElementById("asrResult").textContent = `已切换到 ${reachId}`;
+  render();
+  const card = document.querySelector(".card.viewing");
+  if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+// TTS：朗读当前查看断面（未指定时用优先关注断面）的真实 MQTT 状态
+function ttsSpeak() {
+  const reachId = currentReach || (topReach() ? topReach().reachId : null);
+  const d = reachId ? state[reachId] : null;
+  const text = d
+    ? `${d.reachId}，水位 ${d.waterLevel}，浊度 ${d.turbidity}，水流${FLOW_TEXT[d.flowLevel] ?? d.flowLevel}，状态${d.status}`
+    : "暂无数据";
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "zh-CN";
+  speechSynthesis.cancel();
+  speechSynthesis.speak(u);
+}
+
+document.getElementById("btnTts").addEventListener("click", ttsSpeak);
+
+// ASR：Web Speech API
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let recognizing = false;
+
+if (SpeechRecognition) {
+  recognition = new SpeechRecognition();
+  recognition.lang = "zh-CN";
+  recognition.interimResults = false;
+  recognition.onresult = (e) => {
+    const text = e.results[0][0].transcript;
+    document.getElementById("asrResult").textContent = "语音结果：" + text;
+    handleVoiceCommand(text);
+  };
+  recognition.onerror = (e) => {
+    document.getElementById("asrResult").textContent = "语音识别错误：" + e.error;
+  };
+  recognition.onend = () => {
+    recognizing = false;
+    document.getElementById("btnAsr").textContent = "🎤 语音指令";
+  };
+}
+
+function handleVoiceCommand(text) {
+  const m = text.match(/reach\s*-?\s*([abc])/i);
+  if (m) {
+    setCurrentReach("reach-" + m[1].toLowerCase());
+    return;
+  }
+  if (text.includes("朗读")) {
+    ttsSpeak();
+    return;
+  }
+  document.getElementById("asrResult").textContent = "未识别的指令：" + text;
+}
+
+document.getElementById("btnAsr").addEventListener("click", () => {
+  if (!recognition) {
+    alert("当前浏览器不支持 Web Speech API（建议 Chrome/Edge）");
+    return;
+  }
+  if (recognizing) {
+    recognition.stop();
+    return;
+  }
+  recognizing = true;
+  document.getElementById("btnAsr").textContent = "🎤 正在聆听…";
+  recognition.start();
+});
+
+// Camera：拍照 → 缩略图 → 感知结果记录（contract 4.2）
+let cameraStream = null;
+const photoTarget = { reachId: null, eventId: null };
+
+document.getElementById("btnPhoto").addEventListener("click", async () => {
+  const reachId = currentReach || (topReach() ? topReach().reachId : null);
+  if (!reachId) {
+    alert("暂无断面数据");
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert("当前浏览器不支持摄像头（建议 Chrome/Edge）");
+    return;
+  }
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+  } catch (e) {
+    alert("无法打开摄像头：" + e.message);
+    return;
+  }
+  photoTarget.reachId = reachId;
+  photoTarget.eventId = (openEventByReach[reachId] || lastEventOf(reachId))?.event_id ?? null;
+  const video = document.getElementById("cameraVideo");
+  video.srcObject = cameraStream;
+  document.getElementById("cameraInfo").textContent =
+    `关联断面：${reachId}${photoTarget.eventId ? " · 事件：" + photoTarget.eventId : " · 无关联事件"}`;
+  document.getElementById("cameraModal").style.display = "flex";
+});
+
+function stopCamera() {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(t => t.stop());
+    cameraStream = null;
+  }
+  document.getElementById("cameraVideo").srcObject = null;
+  document.getElementById("cameraModal").style.display = "none";
+}
+
+document.getElementById("btnCapture").addEventListener("click", () => {
+  const video = document.getElementById("cameraVideo");
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 480;
+  canvas.getContext("2d").drawImage(video, 0, 0);
+  const p = n => String(n).padStart(2, "0");
+  const now = new Date();
+  const ts = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+  const photo = {
+    imageId: "img-" + photoTarget.reachId + "-" + ts,
+    reachId: photoTarget.reachId,
+    eventId: photoTarget.eventId,
+    time: `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`,
+    dataUrl: canvas.toDataURL("image/png"),
+  };
+  photos.push(photo);
+  // 感知结果记录：simulated 不伪造置信度，confidence 恒为 null
+  perceptionRecords.push({
+    reachId: photo.reachId,
+    imageId: photo.imageId,
+    flowLevel: state[photo.reachId] ? state[photo.reachId].flowLevel : null,
+    confidence: null,
+    source: "simulated",
+    time: photo.time,
+  });
+  renderPhotos();
+  renderPerceptions();
+  stopCamera();
+});
+
+document.getElementById("btnCameraCancel").addEventListener("click", stopCamera);
+
+function renderPhotos() {
+  const el = document.getElementById("photoThumbs");
+  el.innerHTML = photos.map(ph => `<img src="${ph.dataUrl}" title="${ph.imageId}">`).join("");
+  document.getElementById("btnSavePhoto").style.display = photos.length ? "inline-block" : "none";
+}
+
+function renderPerceptions() {
+  const el = document.getElementById("perceptionList");
+  if (!perceptionRecords.length) {
+    el.innerHTML = '<p class="muted">暂无记录</p>';
+    return;
+  }
+  el.innerHTML = [...perceptionRecords].reverse().map(r => `
+    <div class="perc">
+      <p><b>${r.imageId}</b></p>
+      <p>断面：${r.reachId} · flowLevel：${r.flowLevel} · source：${r.source} · confidence：${r.confidence}</p>
+      <p>时间：${r.time}</p>
+    </div>
+  `).join("");
+}
+
+document.getElementById("btnSavePhoto").addEventListener("click", () => {
+  const photo = photos[photos.length - 1];
+  if (!photo) return;
+  const a = document.createElement("a");
+  a.href = photo.dataUrl;
+  a.download = photo.imageId + ".png";
+  a.click();
 });
 </script>
 </body>

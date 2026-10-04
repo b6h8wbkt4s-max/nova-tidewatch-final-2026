@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>TideWatch 河道 3D</title>
+<style>
+body { margin: 0; overflow: hidden; font-family: "Microsoft YaHei", sans-serif; background: #0d1b2a; }
+canvas { display: block; }
+#hud { position: absolute; top: 12px; left: 12px; background: rgba(13,27,42,.85); color: #eee; padding: 12px 16px; border-radius: 8px; max-width: 300px; z-index: 10; }
+#hud h1 { margin: 0 0 6px 0; font-size: 18px; }
+#hud p { margin: 4px 0; font-size: 14px; }
+#priorityTarget { color: #ffd600; }
+#detail { margin-top: 8px; padding: 8px; background: rgba(255,255,255,.08); border-radius: 6px; font-size: 13px; line-height: 1.6; }
+#legend { position: absolute; right: 12px; bottom: 12px; background: rgba(13,27,42,.85); color: #eee; padding: 10px 12px; border-radius: 8px; font-size: 12px; z-index: 10; line-height: 1.8; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>TideWatch 河道 3D</h1>
+  <p>连接状态：<span id="status">未连接</span></p>
+  <p>当前优先关注：<strong id="priorityTarget">暂无</strong></p>
+  <div id="detail">点击河段查看详情<br>拖拽旋转 · 滚轮缩放</div>
+</div>
+<div id="legend">
+  <div><span class="dot" style="background:#2e7d32"></span>正常</div>
+  <div><span class="dot" style="background:#ef6c00"></span>高水位警戒</div>
+  <div><span class="dot" style="background:#d32f2f"></span>洪水预警</div>
+  <div><span class="dot" style="background:#8e24aa"></span>水质浑浊</div>
+  <div><span class="dot" style="background:#ffd600"></span>优先关注光环</div>
+  <div>事件图标：<span class="dot" style="background:#d32f2f"></span>OPEN 闪烁
+    <span class="dot" style="background:#ef6c00"></span>HANDLING 闪烁
+    <span class="dot" style="background:#2e7d32"></span>RECOVERED 常亮</div>
+</div>
+<script src="three.min.js"></script>
+<script src="OrbitControls.js"></script>
+<script src="mqtt.min.js"></script>
+<script>
+const BROKER_WS = "ws://localhost:8083";
+const TOPIC = "tidewatch/+/state";
+const EVENT_TOPIC = "tidewatch/event/update";
+
+const STATUS_COLOR = { "正常": 0x2e7d32, "高水位警戒": 0xef6c00, "洪水预警": 0xd32f2f, "水质浑浊": 0x8e24aa };
+const ENV_SCORE = { "洪水预警": 3, "高水位警戒": 2, "水质浑浊": 1, "正常": 0 };
+const STATE_ORDER = { OPEN: 1, HANDLING: 2, RECOVERED: 3 };
+const KNOWN_REACHES = ["reach-a", "reach-b", "reach-c"];
+const FLOW_TEXT = ["缓流", "平稳", "湍急", "湍流"];
+
+const state = {};            // reachId -> 最新消息
+const anomalyStreak = {};
+const seenKeys = new Set();
+const seenEventKeys = new Set();
+const latestTimeByReach = {};
+const eventStateByReach = {}; // reachId -> { state, fromStream }
+
+if (typeof THREE === "undefined" || typeof mqtt === "undefined") {
+  const el = document.getElementById("status");
+  el.textContent = "依赖加载失败（three.js / mqtt.js）";
+  el.style.color = "red";
+  throw new Error("依赖加载失败");
+}
+
+/* ---------- 3D 场景 ---------- */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d1b2a);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, 12, 24);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 1, 0);
+controls.maxPolarAngle = Math.PI * 0.42;
+controls.minDistance = 8;
+controls.maxDistance = 50;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(10, 18, 8);
+scene.add(sun);
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(60, 40), new THREE.MeshStandardMaterial({ color: 0x1b3a2a }));
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+scene.add(new THREE.GridHelper(60, 30, 0x2a4a3a, 0x1e3528));
+
+function makeLabel(text) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(0, 0, 256, 64);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 40px Microsoft YaHei";
+  ctx.textAlign = "center";
+  ctx.fillText(text, 128, 46);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas) }));
+  sprite.scale.set(4, 1, 1);
+  return sprite;
+}
+
+const segments = {}; // reachId -> { group, bed, water, column, foams, icon, ring, flow, iconState, isTop, boxHelper }
+
+function buildSegment(reachId, x) {
+  const group = new THREE.Group();
+  group.position.x = x;
+
+  const bed = new THREE.Mesh(new THREE.BoxGeometry(6.4, 0.8, 4.4), new THREE.MeshStandardMaterial({ color: 0x7a5c44 }));
+  bed.position.y = -0.7;
+
+  const water = new THREE.Mesh(new THREE.BoxGeometry(6, 0.6, 4), new THREE.MeshStandardMaterial({ color: STATUS_COLOR["正常"], transparent: true, opacity: 0.85 }));
+  water.position.y = 0;
+
+  const column = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1, 0.8), new THREE.MeshStandardMaterial({ color: STATUS_COLOR["正常"], emissive: STATUS_COLOR["正常"], emissiveIntensity: 0.6 }));
+  column.position.y = 0.5;
+
+  const foams = [];
+  for (let i = 0; i < 5; i++) {
+    const f = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.06, 0.35), new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 }));
+    f.position.set((Math.random() - 0.5) * 5.4, 0.32, (Math.random() - 0.5) * 3.4);
+    foams.push(f);
+    group.add(f);
+  }
+
+  const icon = new THREE.Mesh(new THREE.SphereGeometry(0.4, 16, 16), new THREE.MeshBasicMaterial({ color: STATUS_COLOR["正常"] }));
+  icon.position.y = 3.2;
+  icon.visible = false;
+
+  const ring = new THREE.Mesh(new THREE.RingGeometry(1.7, 2.1, 40), new THREE.MeshBasicMaterial({ color: 0xffd600, side: THREE.DoubleSide, transparent: true, opacity: 0.9 }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.15;
+  ring.visible = false;
+
+  const label = makeLabel(reachId);
+  label.position.y = 2.6;
+
+  group.add(bed, water, column, icon, ring, label);
+  scene.add(group);
+
+  segments[reachId] = { group, bed, water, column, foams, icon, ring, flow: 0, iconState: null, isTop: false, boxHelper: null };
+}
+
+buildSegment("reach-a", -12);
+buildSegment("reach-b", 0);
+buildSegment("reach-c", 12);
+
+/* ---------- 场景更新 ---------- */
+function applySceneData(reachId) {
+  const d = state[reachId];
+  const s = segments[reachId];
+  if (!d || !s) return;
+  const color = STATUS_COLOR[d.status] ?? 0xcccccc;
+  s.water.material.color.setHex(color);
+  s.column.material.color.setHex(color);
+  s.column.material.emissive.setHex(color);
+  // 水位柱高度随 waterLevel 变化
+  const h = Math.max(0.5, (d.waterLevel - 3) * 0.6);
+  s.column.scale.y = h;
+  s.column.position.y = h / 2;
+  s.flow = d.flowLevel ?? 0;
+  applyEventIcon(reachId);
+}
+
+function applyEventIcon(reachId) {
+  const s = segments[reachId];
+  const ev = eventStateByReach[reachId];
+  if (!ev) {
+    s.iconState = null;
+    return;
+  }
+  s.iconState = ev.state;
+  const colors = { OPEN: 0xd32f2f, HANDLING: 0xef6c00, RECOVERED: 0x2e7d32 };
+  s.icon.material.color.setHex(colors[ev.state] ?? 0xffffff);
+}
+
+function scoreOf(reachId) {
+  const d = state[reachId];
+  if (!d) return null;
+  const env = ENV_SCORE[d.status] || 0;
+  const perc = d.flowLevel ?? 0;
+  const streak = anomalyStreak[reachId] || 0;
+  const persist = streak >= 3 ? 2 : (streak >= 1 ? 1 : 0);
+  return env + perc + persist;
+}
+
+function updatePriority() {
+  let top = null;
+  Object.keys(state).forEach(id => {
+    const total = scoreOf(id);
+    if (total !== null && (!top || total > top.total)) top = { reachId: id, total };
+  });
+  Object.keys(segments).forEach(id => { segments[id].isTop = false; });
+  document.getElementById("priorityTarget").textContent =
+    top ? `${top.reachId}（优先分 ${top.total}）` : "暂无";
+  if (top) segments[top.reachId].isTop = true;
+}
+
+/* ---------- 交互：点击选中 ---------- */
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let selectedReach = null;
+
+function setSelected(reachId) {
+  if (selectedReach && segments[selectedReach].boxHelper) {
+    segments[selectedReach].group.remove(segments[selectedReach].boxHelper);
+    segments[selectedReach].boxHelper = null;
+  }
+  selectedReach = reachId;
+  if (!reachId) {
+    updateDetailPanel(null);
+    return;
+  }
+  const s = segments[reachId];
+  s.boxHelper = new THREE.BoxHelper(s.group, 0xffd600);
+  s.group.add(s.boxHelper);
+  updateDetailPanel(reachId);
+}
+
+function updateDetailPanel(reachId) {
+  const el = document.getElementById("detail");
+  if (!reachId || !state[reachId]) {
+    el.textContent = "点击河段查看详情\n拖拽旋转 · 滚轮缩放";
+    return;
+  }
+  const d = state[reachId];
+  el.innerHTML = `
+    <b>${d.reachId}</b><br>
+    水位：${d.waterLevel} m<br>
+    浊度：${d.turbidity} NTU<br>
+    水流：${FLOW_TEXT[d.flowLevel] ?? d.flowLevel}<br>
+    状态：${d.status}<br>
+    时间：${d.time}
+  `;
+}
+
+renderer.domElement.addEventListener("click", (e) => {
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const pickMeshes = [];
+  Object.values(segments).forEach(s => pickMeshes.push(s.water, s.column, s.bed));
+  const hits = raycaster.intersectObjects(pickMeshes, false);
+  if (hits.length) {
+    const hitReach = Object.keys(segments).find(id => {
+      const s = segments[id];
+      return hits[0].object === s.water || hits[0].object === s.column || hits[0].object === s.bed;
+    });
+    setSelected(hitReach);
+  } else {
+    setSelected(null);
+  }
+});
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ---------- MQTT ---------- */
+const client = mqtt.connect(BROKER_WS);
+
+client.on("connect", () => {
+  document.getElementById("status").textContent = "已连接";
+  document.getElementById("status").style.color = "green";
+  client.subscribe(TOPIC);
+  client.subscribe(EVENT_TOPIC, { qos: 1 });
+});
+
+client.on("error", (err) => {
+  document.getElementById("status").textContent = "连接失败：" + err.message;
+  document.getElementById("status").style.color = "red";
+});
+
+client.on("message", (topic, message) => {
+  let data;
+  try {
+    data = JSON.parse(message.toString());
+  } catch (e) {
+    console.error("JSON 解析失败", message.toString());
+    return;
+  }
+  if (topic === "tidewatch/event/update") {
+    handleEventUpdate(data, message.toString());
+    return;
+  }
+  // D4 一致：写错 Topic 的消息拒绝
+  const m = topic.match(/^tidewatch\/(.+)\/state$/);
+  if (m && KNOWN_REACHES.indexOf(m[1]) < 0) return;
+  handleMessage(data);
+});
+
+function handleMessage(data) {
+  if (!data.reachId || typeof data.status !== "string" ||
+      typeof data.waterLevel !== "number" || typeof data.turbidity !== "number") return;
+  if (typeof data.time !== "string" ||
+      !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(data.time) ||
+      isNaN(Date.parse(data.time.replace(" ", "T")))) return;
+
+  const hashKey = "h:" + data.reachId + "|" + data.time + "|" + data.waterLevel + "|" + data.turbidity + "|" + (data.flowLevel ?? "");
+  const idKey = data.message_id ? "m:" + data.message_id : null;
+  if ((idKey && seenKeys.has(idKey)) || seenKeys.has(hashKey)) return;
+  seenKeys.add(hashKey);
+  if (idKey) seenKeys.add(idKey);
+
+  const latest = latestTimeByReach[data.reachId];
+  if (latest !== undefined && data.time <= latest) return;
+  latestTimeByReach[data.reachId] = data.time;
+
+  if (data.status === "正常") {
+    anomalyStreak[data.reachId] = 0;
+  } else {
+    anomalyStreak[data.reachId] = (anomalyStreak[data.reachId] || 0) + 1;
+  }
+  state[data.reachId] = data;
+
+  // 事件图标兜底：无事件流数据时本地推断 OPEN；事件流到达后以事件流为准
+  const evInfo = eventStateByReach[data.reachId];
+  if (!evInfo || !evInfo.fromStream) {
+    if (data.status !== "正常") {
+      eventStateByReach[data.reachId] = { state: "OPEN", fromStream: false };
+    } else if (evInfo && !evInfo.fromStream) {
+      delete eventStateByReach[data.reachId];
+    }
+  }
+
+  applySceneData(data.reachId);
+  updatePriority();
+  if (selectedReach === data.reachId) updateDetailPanel(selectedReach);
+}
+
+function handleEventUpdate(data, raw) {
+  if (!data || typeof data.event_id !== "string" || !data.reachId ||
+      typeof data.state !== "string" || !(data.state in STATE_ORDER)) return;
+  const key = data.message_id ? "m:" + data.message_id : "s:" + raw;
+  if (seenEventKeys.has(key)) return;
+  seenEventKeys.add(key);
+  const cur = eventStateByReach[data.reachId];
+  // 契约 6.3：迟到/重复消息不回退状态
+  if (cur && STATE_ORDER[data.state] < STATE_ORDER[cur.state]) return;
+  eventStateByReach[data.reachId] = { state: data.state, fromStream: true };
+  applyEventIcon(data.reachId);
+}
+
+/* ---------- 动画循环 ---------- */
+const clock = new THREE.Clock();
+
+let elapsed = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  elapsed += dt;
+  const t = elapsed;
+
+  Object.values(segments).forEach(s => {
+    // 泡沫流动：速度随 flowLevel（0 缓流 ~ 3 湍流）
+    const speed = 0.25 + s.flow * 0.55;
+    s.foams.forEach(f => {
+      f.position.x += speed * dt;
+      if (f.position.x > 3.1) f.position.x = -3.1;
+    });
+    // 事件图标：OPEN 快闪红 / HANDLING 慢闪橙 / RECOVERED 绿常亮
+    if (s.iconState === "OPEN") {
+      s.icon.visible = Math.sin(t * 6) > -0.35;
+    } else if (s.iconState === "HANDLING") {
+      s.icon.visible = Math.sin(t * 3) > -0.35;
+    } else if (s.iconState === "RECOVERED") {
+      s.icon.visible = true;
+    } else {
+      s.icon.visible = false;
+    }
+    // 优先关注：金色光环旋转 + 脉动
+    if (s.isTop) {
+      s.ring.visible = true;
+      s.ring.rotation.z += 0.02;
+      s.ring.scale.setScalar(1 + Math.sin(t * 4) * 0.08);
+    } else {
+      s.ring.visible = false;
+    }
+    // 选中描边跟随柱高变化
+    if (s.boxHelper) s.boxHelper.update();
+  });
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

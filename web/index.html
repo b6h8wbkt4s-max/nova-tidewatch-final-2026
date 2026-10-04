@@ -23,6 +23,8 @@ h1 { color: #333; }
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 10; }
 .modal { background: white; padding: 24px; border-radius: 8px; }
 .modal button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
+#testPanel button { margin: 6px 8px 0 0; padding: 6px 12px; cursor: pointer; }
+#msgStats { color: #666; font-size: 14px; }
 .card h2 { margin: 0 0 8px 0; }
 .card p { margin: 4px 0; }
 </style>
@@ -34,7 +36,16 @@ h1 { color: #333; }
 <div id="cards"></div>
 
 <h2>事件列表</h2>
+<p id="msgStats">已处理消息：0 · 重复丢弃：0 · 乱序/迟到：0 · 拒绝：0</p>
 <div id="events"></div>
+
+<h2>测试面板</h2>
+<div id="testPanel">
+  <p id="testLastMsg">最近消息：暂无</p>
+  <button id="btnDup">重复发送最近消息</button>
+  <button id="btnOld">发送旧数据（time 提前 10 分钟）</button>
+  <button id="btnMsgId">发送带 message_id 的消息</button>
+</div>
 
 <div id="actionModal" class="modal-backdrop" style="display:none;">
   <div class="modal">
@@ -57,6 +68,11 @@ const anomalyStreak = {}; // reachId -> 连续异常次数
 const ENV_SCORE = { "洪水预警": 3, "高水位警戒": 2, "水质浑浊": 1, "正常": 0 };
 const events = [];
 const openEventByReach = {}; // reachId -> 未关闭事件（OPEN/HANDLING），防重复创建
+const seenKeys = new Set();   // 去重键：m:message_id 或 h:载荷哈希
+const latestTimeByReach = {}; // 断面最新 time，乱序判断基准
+const lateMessages = [];      // 迟到消息历史补充（F12 可查，最多 10 条）
+let processedCount = 0, dupCount = 0, lateCount = 0, rejectedCount = 0;
+let lastProcessed = null;     // 最近一条已处理消息，供测试面板使用
 
 if (typeof mqtt === "undefined") {
   const el = document.getElementById("status");
@@ -84,9 +100,58 @@ client.on("message", (topic, message) => {
     data = JSON.parse(message.toString());
   } catch (e) {
     console.error("JSON 解析失败", message.toString());
+    rejectedCount++;
+    render();
     return;
   }
-  if (!data.reachId || typeof data.status !== "string") return;
+  handleMessage(data);
+});
+
+// contract 6.5：reachId + time + waterLevel + turbidity + flowLevel，不含 event_id/status
+function msgHash(d) {
+  return d.reachId + "|" + d.time + "|" + d.waterLevel + "|" + d.turbidity + "|" + (d.flowLevel ?? "");
+}
+
+function handleMessage(data) {
+  // 数据质量前置（contract 8.4）：缺字段拒绝
+  if (!data.reachId || typeof data.status !== "string" ||
+      typeof data.waterLevel !== "number" || typeof data.turbidity !== "number") {
+    rejectedCount++;
+    render();
+    return;
+  }
+  // 时钟校验：格式错误或不可解析拒绝
+  if (typeof data.time !== "string" ||
+      !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(data.time) ||
+      isNaN(Date.parse(data.time.replace(" ", "T")))) {
+    rejectedCount++;
+    render();
+    return;
+  }
+
+  // D3-4a 去重：优先 message_id，其次载荷哈希；同一条只生效一次
+  const hashKey = "h:" + msgHash(data);
+  const idKey = data.message_id ? "m:" + data.message_id : null;
+  if ((idKey && seenKeys.has(idKey)) || seenKeys.has(hashKey)) {
+    dupCount++;
+    render();
+    return;
+  }
+  seenKeys.add(hashKey);
+  if (idKey) seenKeys.add(idKey);
+
+  // D3-4b 乱序/迟到：不早于断面最新 time 才算新数据；旧消息不覆盖状态、不动事件
+  const latest = latestTimeByReach[data.reachId];
+  if (latest !== undefined && data.time <= latest) {
+    lateCount++;
+    lateMessages.push(data);
+    if (lateMessages.length > 10) lateMessages.shift();
+    render();
+    return;
+  }
+  latestTimeByReach[data.reachId] = data.time;
+  processedCount++;
+  lastProcessed = { ...data };
 
   const prev = state[data.reachId];
   const wasNormal = !prev || prev.status === "正常";
@@ -140,7 +205,7 @@ client.on("message", (topic, message) => {
   }
 
   render();
-});
+}
 
 function scoreOf(reachId) {
   const d = state[reachId];
@@ -160,6 +225,12 @@ function checkRecovery(ev, data) {
 }
 
 function render() {
+  document.getElementById("msgStats").textContent =
+    `已处理消息：${processedCount} · 重复丢弃：${dupCount} · 乱序/迟到：${lateCount} · 拒绝：${rejectedCount}`;
+  document.getElementById("testLastMsg").textContent = lastProcessed
+    ? `最近消息：${lastProcessed.reachId} ${lastProcessed.time} 水位${lastProcessed.waterLevel} 浊度${lastProcessed.turbidity} flow${lastProcessed.flowLevel}`
+    : "最近消息：暂无";
+
   let top = null;
   Object.values(state).forEach(d => {
     const total = scoreOf(d.reachId).total;
@@ -244,6 +315,27 @@ document.getElementById("actionModal").addEventListener("click", (e) => {
   pendingEventId = null;
   document.getElementById("actionModal").style.display = "none";
   render();
+});
+
+// 测试面板：注入走与 MQTT 相同的 handleMessage 处理管线
+document.getElementById("btnDup").addEventListener("click", () => {
+  if (!lastProcessed) { alert("还没有已处理消息"); return; }
+  handleMessage({ ...lastProcessed });
+});
+
+document.getElementById("btnOld").addEventListener("click", () => {
+  if (!lastProcessed) { alert("还没有已处理消息"); return; }
+  const ts = new Date(lastProcessed.time.replace(" ", "T"));
+  ts.setMinutes(ts.getMinutes() - 10);
+  const p = n => String(n).padStart(2, "0");
+  const time = `${ts.getFullYear()}-${p(ts.getMonth() + 1)}-${p(ts.getDate())} ${p(ts.getHours())}:${p(ts.getMinutes())}:${p(ts.getSeconds())}`;
+  handleMessage({ ...lastProcessed, time });
+});
+
+document.getElementById("btnMsgId").addEventListener("click", () => {
+  if (!lastProcessed) { alert("还没有已处理消息"); return; }
+  // 水位 +0.1 使载荷哈希不同，第一次正常处理；再点一次被 message_id 拦下
+  handleMessage({ ...lastProcessed, message_id: "test-msg-1", waterLevel: lastProcessed.waterLevel + 0.1 });
 });
 </script>
 </body>

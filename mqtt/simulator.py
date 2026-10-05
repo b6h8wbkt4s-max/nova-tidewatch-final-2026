@@ -1,11 +1,17 @@
 import paho.mqtt.client as mqtt
 import json
 import time
+import csv
+import os
 from datetime import datetime
 
 BROKER = "localhost"
 PORT = 1883
 TOPIC_TEMPLATE = "tidewatch/{reachId}/state"
+
+# D5 历史数据：每条 MQTT 消息同时追加到 data/tidewatch_history.csv
+CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "tidewatch_history.csv")
+CSV_FIELDS = ["reachId", "waterLevel", "turbidity", "flowLevel", "status", "time"]
 
 client = mqtt.Client()
 client.connect(BROKER, PORT, 60)
@@ -41,6 +47,16 @@ samples_by_reach = {
     ],
 }
 
+def append_history(payload):
+    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
+    # 表头只写一次：文件不存在或为空时先写表头
+    exists = os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0
+    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({k: payload[k] for k in CSV_FIELDS})
+
 def publish_reach(reachId, waterLevel, turbidity, flowLevel):
     payload = {
         "reachId": reachId,
@@ -52,6 +68,7 @@ def publish_reach(reachId, waterLevel, turbidity, flowLevel):
     }
     topic = TOPIC_TEMPLATE.format(reachId=reachId)
     client.publish(topic, json.dumps(payload, ensure_ascii=False))
+    append_history(payload)
     print("published:", payload)
 
 try:
